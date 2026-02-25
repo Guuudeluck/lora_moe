@@ -1,0 +1,12 @@
+include README.md
+include LICENSE
+include pyproject.toml
+include setup.py
+recursive-include src *.py
+recursive-include examples *.py
+recursive-include docker Dockerfile*
+prune tests
+prune docs
+global-exclude __pycache__
+global-exclude *.py[co]
+global-exclude .DS_Store
