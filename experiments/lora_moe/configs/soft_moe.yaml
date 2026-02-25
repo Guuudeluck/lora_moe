@@ -1,0 +1,57 @@
+# ============================================================
+# Soft MoE LoRA
+# ============================================================
+# Router: linear projection → softmax (dense, all experts participate)
+# All 8 experts contribute to every token; weights are competitive (sum=1).
+# Gradient flows through all experts on every step.
+# Balance challenge: mild — softmax already spreads weight across experts,
+#                    but can still collapse if one expert dominates logits.
+# Balance loss: Switch-Transformer style  L = E * Σ(fᵢ * pᵢ)
+#               where fᵢ=pᵢ=mean softmax prob (dense case, no dispatch mask).
+
+method: softmax_moe
+run_name: soft_moe_e8_r4
+
+model_name_or_path: Qwen/Qwen2.5-1.5B
+attn_implementation: sdpa
+
+# LoRA MoE
+lora_rank: 4
+lora_alpha: 4
+lora_dropout: 0.05
+target_modules:
+  - q_proj
+  - v_proj
+  - k_proj
+  - o_proj
+
+# MoE routing
+num_experts: 8
+top_k: 0          # 0 = dense softmax (ALL experts contribute per token)
+balance_loss_coeff: 0.01
+
+# Dataset
+max_length: 512
+val_split: 0.05
+
+# Training
+num_train_epochs: 3
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 4
+learning_rate: 2.0e-4
+lr_scheduler_type: cosine
+warmup_steps: 30
+weight_decay: 0.0
+max_grad_norm: 1.0
+optim: adamw_torch_fused
+gradient_checkpointing: true
+
+eval_steps: 200
+save_steps: 200
+logging_steps: 10
+save_total_limit: 2
+report_to: tensorboard
+
+output_dir: outputs/soft_moe_e8_r4
+seed: 42
+debug_max_samples: 512

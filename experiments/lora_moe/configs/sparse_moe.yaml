@@ -1,0 +1,67 @@
+# ============================================================
+# Sparse MoE LoRA  (top-k routing)
+# ============================================================
+# Router: linear projection → top-k selection → softmax over selected
+# Each token is hard-routed to exactly k=2 experts.
+# Non-selected experts receive zero weight AND zero gradient.
+# This is the classic MoE style: Switch Transformer, Mixtral, etc.
+#
+# Key properties vs Soft MoE:
+#   - Experts see only a subset of tokens → specialisation pressure is HIGH
+#   - Router gradient is blocked for non-selected experts (hard discrete choice)
+#   - Load imbalance is a MAJOR risk: if the router always picks the same 2
+#     experts, remaining 6 are never trained → expert collapse
+#   - Requires a carefully tuned balance_loss_coeff to avoid collapse
+#
+# Balance loss: Switch-Transformer  L = E * Σ(fᵢ * pᵢ)
+#   fᵢ = fraction of tokens dispatched to expert i  (from dispatch mask)
+#   pᵢ = mean full softmax probability for expert i
+#   These two terms are multiplied so both routing frequency AND probability
+#   are penalised when imbalanced.
+
+method: softmax_moe
+run_name: sparse_moe_e8_r4_top2
+
+model_name_or_path: Qwen/Qwen2.5-1.5B
+attn_implementation: sdpa
+
+# LoRA MoE
+lora_rank: 4
+lora_alpha: 4
+lora_dropout: 0.05
+target_modules:
+  - q_proj
+  - v_proj
+  - k_proj
+  - o_proj
+
+# MoE routing
+num_experts: 8
+top_k: 2          # each token goes to exactly 2 of 8 experts (hard routing)
+balance_loss_coeff: 0.01   # increase to 0.05 if expert collapse is observed
+
+# Dataset
+max_length: 512
+val_split: 0.05
+
+# Training
+num_train_epochs: 3
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 4
+learning_rate: 2.0e-4
+lr_scheduler_type: cosine
+warmup_steps: 30
+weight_decay: 0.0
+max_grad_norm: 1.0
+optim: adamw_torch_fused
+gradient_checkpointing: true
+
+eval_steps: 200
+save_steps: 200
+logging_steps: 10
+save_total_limit: 2
+report_to: tensorboard
+
+output_dir: outputs/sparse_moe_e8_r4_top2
+seed: 42
+debug_max_samples: 512
