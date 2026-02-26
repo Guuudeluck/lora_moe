@@ -19,7 +19,7 @@ Usage:
         --learning_rate 2e-4
 
     # Run all three methods sequentially
-    for cfg in standard_lora softmax_moe abmil_moe; do
+    for cfg in standard_lora softmax_lora_moe abmil_moe; do
         python -m experiments.lora_moe.run_experiment --config configs/${cfg}.yaml
     done
 """
@@ -52,6 +52,7 @@ if str(_REPO_ROOT) not in sys.path:
 from experiments.lora_moe.data import load_alpaca
 from experiments.lora_moe.injection import inject_lora, print_trainable_params
 from experiments.lora_moe.modules.lora_layers import LoRAConfig, MoELoRAConfig
+from experiments.lora_moe.modules.ffn_moe_layers import MoEFFNConfig
 from experiments.lora_moe.trainer import LoRAMoETrainer
 
 
@@ -69,7 +70,8 @@ def parse_args() -> argparse.Namespace:
     # Any yaml key can be overridden on the CLI
     parser.add_argument("--model_name_or_path", type=str)
     parser.add_argument("--method", type=str,
-                        choices=["standard", "softmax_moe", "abmil_moe"])
+                        choices=["standard", "softmax_lora_moe", "abmil_moe",
+                                 "qlora", "soft_moe", "sparse_moe", "soft_lora_moe"])
     parser.add_argument("--output_dir", type=str)
     parser.add_argument("--num_train_epochs", type=int)
     parser.add_argument("--learning_rate", type=float)
@@ -79,7 +81,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_samples", type=int)
     parser.add_argument("--lora_rank", type=int)
     parser.add_argument("--num_experts", type=int)
+    parser.add_argument("--expert_hidden_dim", type=int)
     parser.add_argument("--balance_loss_coeff", type=float)
+    parser.add_argument("--load_in_4bit", action="store_true")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--report_to", type=str, help="wandb | tensorboard | none")
 
@@ -101,7 +105,7 @@ def load_config(args: argparse.Namespace) -> dict:
     for key in [
         "model_name_or_path", "method", "output_dir", "num_train_epochs",
         "learning_rate", "per_device_train_batch_size", "gradient_accumulation_steps",
-        "max_length", "max_samples", "lora_rank", "num_experts",
+        "max_length", "max_samples", "lora_rank", "num_experts", "expert_hidden_dim",
         "balance_loss_coeff", "seed", "report_to",
     ]:
         val = getattr(args, key, None)
@@ -125,16 +129,27 @@ def load_config(args: argparse.Namespace) -> dict:
 # Build LoRA config from experiment config
 # ---------------------------------------------------------------------------
 
-def build_lora_cfg(cfg: dict) -> LoRAConfig | MoELoRAConfig:
+def build_lora_cfg(cfg: dict) -> LoRAConfig | MoELoRAConfig | MoEFFNConfig:
     method = cfg["method"]
     target = cfg.get("target_modules", ["q_proj", "v_proj"])
     rank = cfg.get("lora_rank", 16)
     alpha = cfg.get("lora_alpha", float(rank))
     dropout = cfg.get("lora_dropout", 0.05)
 
-    if method == "standard":
+    if method in ("standard", "qlora"):
         return LoRAConfig(rank=rank, alpha=alpha, dropout=dropout, target_modules=target)
 
+    if method in ("soft_moe", "sparse_moe"):
+        return MoEFFNConfig(
+            num_experts=cfg.get("num_experts", 8),
+            expert_hidden_dim=cfg.get("expert_hidden_dim", 4),
+            top_k=cfg.get("top_k", 0) if method == "soft_moe" else cfg.get("top_k", 2),
+            dropout=dropout,
+            balance_loss_coeff=cfg.get("balance_loss_coeff", 0.01),
+            target_modules=target,
+        )
+
+    # MoELoRAConfig: softmax_lora_moe | abmil_moe | soft_lora_moe
     return MoELoRAConfig(
         rank=rank,
         alpha=alpha,
@@ -198,12 +213,48 @@ def main() -> None:
 
     # ---- Model ----
     print("Loading base model...")
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg["model_name_or_path"],
-        dtype=torch.bfloat16,
-        trust_remote_code=True,
-        attn_implementation=cfg.get("attn_implementation", "sdpa"),
-    )
+    skip_to_device = False
+
+    if method == "qlora" or cfg.get("load_in_4bit", False):
+        # PyTorch < 2.5 is missing nn.Module.set_submodule; patch it so that
+        # Transformers 5.x bitsandbytes integration works on PyTorch 2.4.x.
+        import torch.nn as _nn
+        if not hasattr(_nn.Module, "set_submodule"):
+            def _set_submodule(self, target: str, module):
+                atoms = target.split(".")
+                mod = self
+                for item in atoms[:-1]:
+                    mod = getattr(mod, item)
+                setattr(mod, atoms[-1], module)
+            _nn.Module.set_submodule = _set_submodule
+
+        from transformers import BitsAndBytesConfig
+        from peft import prepare_model_for_kbit_training
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg["model_name_or_path"],
+            quantization_config=bnb_config,
+            trust_remote_code=True,
+            attn_implementation=cfg.get("attn_implementation", "sdpa"),
+            device_map="auto",
+        )
+        model = prepare_model_for_kbit_training(
+            model, use_gradient_checkpointing=True
+        )
+        skip_to_device = True
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg["model_name_or_path"],
+            dtype=torch.bfloat16,
+            trust_remote_code=True,
+            attn_implementation=cfg.get("attn_implementation", "sdpa"),
+        )
+
     model.config.use_cache = False          # required for gradient checkpointing
 
     # ---- Inject LoRA ----
@@ -212,13 +263,21 @@ def main() -> None:
     inject_lora(model, method=method, cfg=lora_cfg)
     print_trainable_params(model)
 
-    # Move the full model (frozen weights + newly injected LoRA params) to GPU.
-    # This must happen AFTER injection: inject_lora creates new nn.Parameters on CPU.
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Moving model to {device}...")
-    model = model.to(device)
+    # Signal to Transformers 5.x Trainer that trainable adapters have been attached.
+    # Without this flag, the quantization validator rejects training of 4-bit models
+    # that are not wrapped via peft.PeftModel (our custom injection bypasses PEFT).
+    if skip_to_device:
+        model._hf_peft_config_loaded = True
 
-    if cfg.get("gradient_checkpointing", True):
+    if not skip_to_device:
+        # Move the full model (frozen weights + newly injected LoRA params) to GPU.
+        # Cast to bfloat16 as well: inject_lora creates new float32 parameters, which
+        # would cause dtype mismatches with the bfloat16 backbone.
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Moving model to {device} (bfloat16)...")
+        model = model.to(device=device, dtype=torch.bfloat16)
+
+    if not skip_to_device and cfg.get("gradient_checkpointing", True):
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
@@ -277,7 +336,9 @@ def main() -> None:
     )
 
     balance_coeff = (
-        lora_cfg.balance_loss_coeff if isinstance(lora_cfg, MoELoRAConfig) else 0.0
+        lora_cfg.balance_loss_coeff
+        if isinstance(lora_cfg, (MoELoRAConfig, MoEFFNConfig))
+        else 0.0
     )
 
     trainer = LoRAMoETrainer(

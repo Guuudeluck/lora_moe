@@ -1,7 +1,11 @@
 #!/bin/bash
-# Run all three MoE routing experiments then analyze.
-# Primary comparison: Soft MoE vs Sparse MoE vs ABMIL MoE
-# Standard LoRA is kept as a background sanity-check baseline.
+# Stage A: Run all four MoE routing experiments on Qwen2.5-7B then analyze.
+#
+# Variants:
+#   qlora          – NF4 4-bit QLoRA baseline (r=16)
+#   soft_moe       – Dense softmax + FFN experts (E=8, H=4)
+#   sparse_moe     – Top-k=2 + FFN experts     (E=8, H=4)
+#   soft_lora_moe  – ABMIL sigmoid + LoRA experts (E=8, r=4, att_dim=32)
 
 set -e
 
@@ -10,49 +14,49 @@ CONFIG_DIR="experiments/lora_moe/configs"
 
 cd "$REPO_ROOT"
 
-# ── Debug check (uncomment to validate the full pipeline in ~3 min) ────────
-# for method in soft_moe sparse_moe abmil_moe; do
-#     echo ">>> DEBUG: $method"
+# ── Debug check (uncomment to validate the full pipeline in ~5 min) ─────────
+# for cfg in qlora soft_moe sparse_moe soft_lora_moe; do
+#     echo ">>> DEBUG: $cfg"
 #     python3 -m experiments.lora_moe.run_experiment \
-#         --config $CONFIG_DIR/${method}.yaml --debug
+#         --config $CONFIG_DIR/${cfg}.yaml --debug
 # done
 
 echo "================================================================"
-echo " [1/4] Standard LoRA (sanity-check baseline)"
+echo " [1/4] QLoRA baseline (NF4 4-bit + LoRA r=16)"
 echo "================================================================"
 python3 -m experiments.lora_moe.run_experiment \
-    --config $CONFIG_DIR/standard_lora.yaml
+    --config $CONFIG_DIR/qlora.yaml
 
 echo "================================================================"
-echo " [2/4] Soft MoE LoRA (dense softmax routing)"
+echo " [2/4] Soft-MoE  (dense softmax + FFN experts, E=8, H=4)"
 echo "================================================================"
 python3 -m experiments.lora_moe.run_experiment \
     --config $CONFIG_DIR/soft_moe.yaml
 
 echo "================================================================"
-echo " [3/4] Sparse MoE LoRA (top-2 hard routing)"
+echo " [3/4] Sparse-MoE  (top-k=2 + FFN experts, E=8, H=4)"
 echo "================================================================"
 python3 -m experiments.lora_moe.run_experiment \
     --config $CONFIG_DIR/sparse_moe.yaml
 
 echo "================================================================"
-echo " [4/4] ABMIL MoE LoRA (gated-attention sigmoid routing)"
+echo " [4/4] Soft-LoRA-MoE  (ABMIL sigmoid routing, E=8, r=4)"
 echo "================================================================"
 python3 -m experiments.lora_moe.run_experiment \
-    --config $CONFIG_DIR/abmil_moe.yaml
+    --config $CONFIG_DIR/soft_lora_moe.yaml
 
 echo "================================================================"
-echo " Analyzing results..."
+echo " Analyzing Stage A results..."
 echo "================================================================"
 python3 -m experiments.lora_moe.analyze_results \
-    --dirs  outputs/standard_lora_r16 \
-            outputs/soft_moe_e8_r4 \
-            outputs/sparse_moe_e8_r4_top2 \
-            outputs/abmil_moe_e8_r4 \
-    --labels "Standard LoRA (r=16)" \
-             "Soft MoE (E=8, r=4, dense)" \
-             "Sparse MoE (E=8, r=4, top-2)" \
-             "ABMIL MoE (E=8, r=4, sigmoid)" \
-    --out_dir figures/
+    --dirs  outputs/qlora_7b \
+            outputs/soft_moe_e8_h4 \
+            outputs/sparse_moe_e8_h4_top2 \
+            outputs/soft_lora_moe_e8_r4 \
+    --labels "QLoRA (r=16)" \
+             "Soft-MoE (E=8,H=4)" \
+             "Sparse-MoE (E=8,H=4,top2)" \
+             "Soft-LoRA-MoE (ABMIL)" \
+    --out_dir figures/stageA/
 
-echo "Done! Figures in: figures/"
+echo "Done! Figures in: figures/stageA/"

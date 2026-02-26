@@ -11,7 +11,7 @@ Reads TensorBoard event logs from each output_dir and produces:
 
 Usage:
     python -m experiments.lora_moe.analyze_results \
-        --dirs outputs/standard_lora_r16 outputs/softmax_moe_e8_r4 outputs/abmil_moe_e8_r4 \
+        --dirs outputs/standard_lora_r16 outputs/softmax_lora_moe_e8_r4 outputs/abmil_moe_e8_r4 \
         --labels "Standard LoRA" "Softmax MoE" "ABMIL MoE" \
         --out_dir figures/
 """
@@ -94,8 +94,8 @@ def load_eval_metrics(run_dir: str) -> Dict[str, float]:
 # Plot helpers
 # ---------------------------------------------------------------------------
 
-COLORS = ["#2196F3", "#FF5722", "#4CAF50"]   # blue, orange, green
-LINESTYLES = ["-", "--", "-."]
+COLORS = ["#2196F3", "#FF5722", "#4CAF50", "#9C27B0"]   # blue, orange, green, purple
+LINESTYLES = ["-", "--", "-.", ":"]
 
 
 def smooth(values: List[float], window: int = 5) -> List[float]:
@@ -182,7 +182,7 @@ def main() -> None:
                 "Training Loss", "Loss", smooth_window=10)
     plot_scalar(axes[1], run_data, labels, "eval_loss",
                 "Validation Loss", "Loss", smooth_window=1)
-    fig.suptitle("Loss Comparison: Standard LoRA vs Softmax MoE vs ABMIL MoE",
+    fig.suptitle("Stage A Loss Comparison: QLoRA / Soft-MoE / Sparse-MoE / Soft-LoRA-MoE",
                  fontsize=13, fontweight="bold")
     fig.tight_layout()
     path = os.path.join(args.out_dir, "loss_curves.png")
@@ -191,10 +191,18 @@ def main() -> None:
     plt.close(fig)
 
     # -------------------------------------------------------------------
-    # Figure 2: Routing metrics (MoE only)
+    # Figure 2: Routing metrics (MoE only; skip pure-LoRA baselines)
     # -------------------------------------------------------------------
-    moe_data = [d for d, l in zip(run_data, labels) if "LoRA" not in l or "MoE" in l]
-    moe_labels = [l for l in labels if "LoRA" not in l or "MoE" in l]
+    # Exclude standard LoRA / QLoRA rows that have no routing metrics
+    _no_routing = {"standard", "qlora", "soft_moe", "sparse_moe"}
+    moe_data = [
+        d for d, l in zip(run_data, labels)
+        if not any(tag in l.lower() for tag in ("qlora", "standard lora"))
+    ]
+    moe_labels = [
+        l for l in labels
+        if not any(tag in l.lower() for tag in ("qlora", "standard lora"))
+    ]
     # Fallback: use all
     if not moe_data:
         moe_data, moe_labels = run_data, labels

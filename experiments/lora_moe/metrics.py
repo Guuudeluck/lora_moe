@@ -23,8 +23,12 @@ from experiments.lora_moe.modules.lora_layers import (
     ABMILMoELoRALinear,
     SoftmaxMoELoRALinear,
 )
+from experiments.lora_moe.modules.ffn_moe_layers import (
+    SoftMoEFFNLinear,
+    SparseMoEFFNLinear,
+)
 
-_MoELayer = (ABMILMoELoRALinear, SoftmaxMoELoRALinear)
+_MoELayer = (ABMILMoELoRALinear, SoftmaxMoELoRALinear, SoftMoEFFNLinear, SparseMoEFFNLinear)
 
 
 # ---------------------------------------------------------------------------

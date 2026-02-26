@@ -1,44 +1,37 @@
 # ============================================================
-# Sparse MoE LoRA  (top-k routing)
+# Sparse-MoE  (top-k routing + FFN experts)
 # ============================================================
-# Router: linear projection → top-k selection → softmax over selected
-# Each token is hard-routed to exactly k=2 experts.
-# Non-selected experts receive zero weight AND zero gradient.
-# This is the classic MoE style: Switch Transformer, Mixtral, etc.
+# Router: linear → top-k=2 selection → softmax over selected
+# Experts: 2-layer FFN delta  GELU(x @ W1_e) @ W2_e
+#   Each token is hard-routed to exactly top_k=2 of 8 experts.
 #
-# Key properties vs Soft MoE:
-#   - Experts see only a subset of tokens → specialisation pressure is HIGH
-#   - Router gradient is blocked for non-selected experts (hard discrete choice)
-#   - Load imbalance is a MAJOR risk: if the router always picks the same 2
-#     experts, remaining 6 are never trained → expert collapse
-#   - Requires a carefully tuned balance_loss_coeff to avoid collapse
+# Balance loss: Switch-Transformer sparse  L = E * Σ frac_e * p_e
+#   frac_e = fraction tokens dispatched to expert e  (non-diff, from dispatch mask)
+#   p_e    = mean full softmax prob for expert e      (differentiable, live graph)
+# Only p_e carries gradient → correct sparse Switch-Transformer loss.
 #
-# Balance loss: Switch-Transformer  L = E * Σ(fᵢ * pᵢ)
-#   fᵢ = fraction of tokens dispatched to expert i  (from dispatch mask)
-#   pᵢ = mean full softmax probability for expert i
-#   These two terms are multiplied so both routing frequency AND probability
-#   are penalised when imbalanced.
+# Load imbalance is a key risk: monitor routing/global_cv.
+# Increase balance_loss_coeff to 0.05 if expert collapse is observed.
+#
+# Trainable params: same as Soft-MoE ≈ 23.4M (identical architecture, different routing)
 
-method: softmax_moe
-run_name: sparse_moe_e8_r4_top2
+method: sparse_moe
+run_name: sparse_moe_e8_h4_top2
 
-model_name_or_path: Qwen/Qwen2.5-1.5B
+model_name_or_path: Qwen/Qwen2.5-7B
 attn_implementation: sdpa
 
-# LoRA MoE
-lora_rank: 4
-lora_alpha: 4
+# FFN MoE
+num_experts: 8
+expert_hidden_dim: 4     # H; equals lora_rank for param-budget matching
+top_k: 2                 # each token is routed to exactly 2 of 8 experts
 lora_dropout: 0.05
+balance_loss_coeff: 0.01  # increase to 0.05 if expert collapse is observed
 target_modules:
   - q_proj
-  - v_proj
   - k_proj
+  - v_proj
   - o_proj
-
-# MoE routing
-num_experts: 8
-top_k: 2          # each token goes to exactly 2 of 8 experts (hard routing)
-balance_loss_coeff: 0.01   # increase to 0.05 if expert collapse is observed
 
 # Dataset
 max_length: 512
@@ -46,8 +39,8 @@ val_split: 0.05
 
 # Training
 num_train_epochs: 3
-per_device_train_batch_size: 4
-gradient_accumulation_steps: 4
+per_device_train_batch_size: 16
+gradient_accumulation_steps: 2    # effective batch = 32
 learning_rate: 2.0e-4
 lr_scheduler_type: cosine
 warmup_steps: 30
@@ -62,6 +55,7 @@ logging_steps: 10
 save_total_limit: 2
 report_to: tensorboard
 
-output_dir: outputs/sparse_moe_e8_r4_top2
+output_dir: outputs/sparse_moe_e8_h4_top2
 seed: 42
 debug_max_samples: 512
+dataloader_num_workers: 8

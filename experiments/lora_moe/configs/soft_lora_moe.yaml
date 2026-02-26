@@ -1,0 +1,71 @@
+# ============================================================
+# Soft-LoRA-MoE  (ABMIL gated-sigmoid routing + LoRA experts)
+# ============================================================
+# Our method: Attention-Based MIL router with independent sigmoid scoring.
+# Router:  V(x) = tanh(W_V · x)
+#          U(x) = sigmoid(W_U · x)
+#          scores = W_out · (V ⊙ U)         [B, N, E]
+#          w_i = sigmoid(scores_i)           independent, NOT competitive
+#
+# Key differences from Soft/Sparse-MoE:
+#   - Gated attention router (richer representation)
+#   - Sigmoid scoring: experts are independent (all can be fully active)
+#   - LoRA experts A/B instead of FFN W1/W2
+#
+# Balance loss: variance of per-expert mean sigmoid activation (live graph)
+#
+# att_dim=32 chosen proportionally to 7B hidden_dim=3584
+#   (was att_dim=128 for 1.5B hidden_dim=1536; ratio ≈ same)
+#
+# Trainable params (Qwen2.5-7B, 28 layers, q+k+v+o, E=8, r=4, att_dim=32):
+#   LoRA experts per layer: E × (D_in×r + r×D_out) ≈ 20.2M total
+#   ABMIL router per layer: 3584×32×2 + 32×8 = ~230K × 28 × 4 ≈ 25.8M
+#   → ~46M total  (router dominates; reduce att_dim to 16 for ~13M router)
+
+method: soft_lora_moe
+run_name: soft_lora_moe_e8_r4
+
+model_name_or_path: Qwen/Qwen2.5-7B
+attn_implementation: sdpa
+
+# LoRA MoE
+lora_rank: 4
+lora_alpha: 4
+lora_dropout: 0.05
+target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+
+# ABMIL MoE-specific
+num_experts: 8
+attention_dim: 32         # proportionally similar to att_dim=128 on 1.5B
+balance_loss_coeff: 0.01
+
+# Dataset
+max_length: 512
+val_split: 0.05
+
+# Training
+num_train_epochs: 3
+per_device_train_batch_size: 16
+gradient_accumulation_steps: 2    # effective batch = 32
+learning_rate: 2.0e-4
+lr_scheduler_type: cosine
+warmup_steps: 30
+weight_decay: 0.0
+max_grad_norm: 1.0
+optim: adamw_torch_fused
+gradient_checkpointing: true
+
+eval_steps: 200
+save_steps: 200
+logging_steps: 10
+save_total_limit: 2
+report_to: tensorboard
+
+output_dir: outputs/soft_lora_moe_e8_r4
+seed: 42
+debug_max_samples: 512
+dataloader_num_workers: 8

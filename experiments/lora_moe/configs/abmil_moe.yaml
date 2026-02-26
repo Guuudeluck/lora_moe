@@ -33,7 +33,7 @@ attention_dim: 128        # ABMIL gated attention hidden dim
 balance_loss_coeff: 0.01  # weight of variance-based balance loss
 
 # Trainable param budget (approx, Qwen2.5-1.5B, r=4, 8 experts):
-#   LoRA params:    same as softmax_moe ≈ 20.4M
+#   LoRA params:    same as softmax_lora_moe ≈ 20.4M
 #   Router (ABMIL): 28 × 4 × (1536×128×2 + 128×8) ≈ 1.4M   (vs 0.7M for softmax)
 #   Total ≈ 21.8M  (router is slightly bigger due to V+U projection)
 

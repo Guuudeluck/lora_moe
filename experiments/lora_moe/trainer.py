@@ -25,7 +25,7 @@ class LoRAMoETrainer(Trainer):
     """
     Drop-in Trainer subclass.  Pass extra kwargs:
         balance_loss_coeff  (float, default 0.01)
-        method              (str)   – "standard" | "softmax_moe" | "abmil_moe"
+        method              (str)   – "standard" | "softmax_lora_moe" | "abmil_moe"
     """
 
     def __init__(self, *args, balance_loss_coeff: float = 0.01, method: str = "abmil_moe", **kwargs):
@@ -33,6 +33,13 @@ class LoRAMoETrainer(Trainer):
         self.balance_loss_coeff = balance_loss_coeff
         self.method = method
         self._routing_log_buffer: Dict[str, float] = {}
+        # _hf_peft_config_loaded=True is needed only to pass
+        # validate_quantization_for_training() in super().__init__() above.
+        # Leaving it set causes save_pretrained to call PEFT-specific methods
+        # (active_adapters, get_adapter_state_dict) that don't exist on our
+        # custom-injected model.  Safe to remove now that __init__ is done.
+        if hasattr(self.model, "_hf_peft_config_loaded"):
+            del self.model._hf_peft_config_loaded
 
     # ------------------------------------------------------------------
     # Override compute_loss to inject balance loss

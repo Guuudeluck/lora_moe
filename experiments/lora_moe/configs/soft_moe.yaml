@@ -1,34 +1,41 @@
 # ============================================================
-# Soft MoE LoRA
+# Soft-MoE  (dense softmax routing + FFN experts)
 # ============================================================
-# Router: linear projection → softmax (dense, all experts participate)
-# All 8 experts contribute to every token; weights are competitive (sum=1).
-# Gradient flows through all experts on every step.
-# Balance challenge: mild — softmax already spreads weight across experts,
-#                    but can still collapse if one expert dominates logits.
-# Balance loss: Switch-Transformer style  L = E * Σ(fᵢ * pᵢ)
-#               where fᵢ=pᵢ=mean softmax prob (dense case, no dispatch mask).
+# Router: linear → softmax (all E experts participate per token)
+# Experts: 2-layer FFN delta  GELU(x @ W1_e) @ W2_e
+#   W1: [E, D_in, H]  W2: [E, H, D_out]  with H=expert_hidden_dim
+#
+# When H = lora_rank, FFN and LoRA experts have identical param counts;
+# the only structural difference is the GELU nonlinearity.
+#
+# Balance loss: Switch-Transformer dense  L = E * Σ p_e^2
+#   (f_e = p_e in the dense case, so L = E * Σ p_e * p_e)
+# Balance loss is computed with a LIVE computation graph so gradients
+# flow back to the router — unlike the original detached implementation.
+#
+# Trainable params (Qwen2.5-7B, 28 layers, q+k+v+o, E=8, H=4):
+#   Per linear: router [3584×8] + W1 [8×3584×4] + W2 [8×4×D_out]
+#   q/o proj: D_out=3584 → W2=[8×4×3584]  → ~115K + 1.15M per layer
+#   k/v proj: D_out=512  → W2=[8×4×512]   → ~115K + 0.16M per layer
+#   × 28 layers × 4 targets ≈ 23.4M total
 
-method: softmax_moe
-run_name: soft_moe_e8_r4
+method: soft_moe
+run_name: soft_moe_e8_h4
 
-model_name_or_path: Qwen/Qwen2.5-1.5B
+model_name_or_path: Qwen/Qwen2.5-7B
 attn_implementation: sdpa
 
-# LoRA MoE
-lora_rank: 4
-lora_alpha: 4
+# FFN MoE
+num_experts: 8
+expert_hidden_dim: 4     # H; equals lora_rank for param-budget matching
+top_k: 0                 # 0 = dense softmax (all experts participate)
 lora_dropout: 0.05
+balance_loss_coeff: 0.01
 target_modules:
   - q_proj
-  - v_proj
   - k_proj
+  - v_proj
   - o_proj
-
-# MoE routing
-num_experts: 8
-top_k: 0          # 0 = dense softmax (ALL experts contribute per token)
-balance_loss_coeff: 0.01
 
 # Dataset
 max_length: 512
@@ -36,8 +43,8 @@ val_split: 0.05
 
 # Training
 num_train_epochs: 3
-per_device_train_batch_size: 4
-gradient_accumulation_steps: 4
+per_device_train_batch_size: 16
+gradient_accumulation_steps: 2    # effective batch = 32
 learning_rate: 2.0e-4
 lr_scheduler_type: cosine
 warmup_steps: 30
@@ -52,6 +59,7 @@ logging_steps: 10
 save_total_limit: 2
 report_to: tensorboard
 
-output_dir: outputs/soft_moe_e8_r4
+output_dir: outputs/soft_moe_e8_h4
 seed: 42
 debug_max_samples: 512
+dataloader_num_workers: 8

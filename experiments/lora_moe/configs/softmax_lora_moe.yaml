@@ -5,8 +5,8 @@
 # Experts are COMPETITIVE (probabilities sum to 1)
 # Balance loss: Switch-Transformer style  L = E * sum(f_i * p_i)
 
-method: softmax_moe
-run_name: softmax_moe_e8_r4
+method: softmax_lora_moe
+run_name: softmax_lora_moe_e8_r4
 
 # Model
 model_name_or_path: Qwen/Qwen2.5-1.5B
@@ -34,7 +34,7 @@ balance_loss_coeff: 0.01  # Switch-Transformer balance loss weight
 #
 # For a truly parameter-matched comparison use:
 #   standard:     lora_rank: 16  (target: q,v,k,o)  → ~10M trainable
-#   softmax_moe:  lora_rank: 4,  num_experts: 4      → ~10M trainable
+#   softmax_lora_moe:  lora_rank: 4,  num_experts: 4      → ~10M trainable
 
 # Dataset
 max_length: 512
@@ -60,7 +60,7 @@ save_total_limit: 2
 report_to: tensorboard
 
 # Output
-output_dir: outputs/softmax_moe_e8_r4
+output_dir: outputs/softmax_lora_moe_e8_r4
 seed: 42
 
 debug_max_samples: 512

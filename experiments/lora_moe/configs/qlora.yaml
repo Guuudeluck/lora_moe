@@ -1,0 +1,51 @@
+# ============================================================
+# QLoRA baseline (NF4 4-bit quantized backbone + standard LoRA)
+# ============================================================
+# Backbone: Qwen2.5-7B loaded in 4-bit NF4 (bitsandbytes)
+# Adapters: standard LoRA r=16 on q/k/v/o_proj (all 28 layers)
+# Trainable params ≈ 10.1M  (identical budget to 1.5B run, scaled to 7B)
+
+method: qlora
+run_name: qlora_7b
+
+# Model
+model_name_or_path: Qwen/Qwen2.5-7B
+attn_implementation: sdpa
+load_in_4bit: true
+
+# LoRA (PEFT baseline)
+lora_rank: 16
+lora_alpha: 16          # scaling = 1.0
+lora_dropout: 0.05
+target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+
+# Dataset
+max_length: 512
+val_split: 0.05
+
+# Training
+num_train_epochs: 3
+per_device_train_batch_size: 16
+gradient_accumulation_steps: 2    # effective batch = 32
+learning_rate: 2.0e-4
+lr_scheduler_type: cosine
+warmup_steps: 30
+weight_decay: 0.0
+max_grad_norm: 1.0
+optim: paged_adamw_8bit           # memory-efficient optimizer for QLoRA
+gradient_checkpointing: true
+
+eval_steps: 200
+save_steps: 200
+logging_steps: 10
+save_total_limit: 2
+report_to: tensorboard
+
+output_dir: outputs/qlora_7b
+seed: 42
+debug_max_samples: 512
+dataloader_num_workers: 8

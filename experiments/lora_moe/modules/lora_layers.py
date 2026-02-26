@@ -85,7 +85,50 @@ class _BaseLoRALinear(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 1. Standard LoRA
+# 1a. QLoRA adapter (wraps a frozen quantized linear; does NOT copy weights)
+# ---------------------------------------------------------------------------
+
+class QLoRALinear(nn.Module):
+    """
+    LoRA adapter for a bitsandbytes 4-bit quantized (NF4) linear layer.
+
+    Unlike StandardLoRALinear, this class keeps the original quantized module
+    intact and calls its forward() to get the base output.  This is necessary
+    because the quantized weights are stored as raw bytes and cannot be passed
+    to F.linear() directly.
+
+    output = base_linear(x)  +  scaling * (dropout(x) @ A) @ B
+    """
+
+    def __init__(self, linear: nn.Module, cfg: LoRAConfig):
+        super().__init__()
+        self.base_linear = linear           # frozen quantized module, kept in place
+        self.in_features  = linear.in_features
+        self.out_features = linear.out_features
+        self.scaling = cfg.alpha / cfg.rank
+        self.dropout = nn.Dropout(p=cfg.dropout) if cfg.dropout > 0 else nn.Identity()
+
+        self.lora_A = nn.Parameter(
+            torch.randn(self.in_features, cfg.rank) * (1.0 / math.sqrt(cfg.rank))
+        )
+        self.lora_B = nn.Parameter(torch.zeros(cfg.rank, self.out_features))
+
+        self._last_router_weights = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = self.base_linear(x)                           # handles NF4 dequant internally
+        lora = self.dropout(x) @ self.lora_A @ self.lora_B
+        return base + self.scaling * lora
+
+    def compute_balance_loss(self) -> torch.Tensor:
+        return torch.tensor(0.0)
+
+    def get_routing_stats(self) -> dict:
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# 1b. Standard LoRA
 # ---------------------------------------------------------------------------
 
 class StandardLoRALinear(_BaseLoRALinear):
@@ -139,8 +182,8 @@ class SoftmaxMoELoRALinear(_BaseLoRALinear):
         )
         self.experts_B = nn.Parameter(torch.zeros(E, cfg.rank, self.out_features))
 
-        # Stored for balance-loss computation
-        self._last_router_logits: Optional[torch.Tensor] = None
+        # Stored for balance-loss computation (live graph, set in forward)
+        self._balance_loss: Optional[torch.Tensor] = None
         self._last_dispatch_mask: Optional[torch.Tensor] = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -153,9 +196,11 @@ class SoftmaxMoELoRALinear(_BaseLoRALinear):
 
         base = F.linear(x, self.weight, self.bias)
 
-        # Router
+        # Router (keep logits in live graph for balance loss gradient)
         logits = self.router(x)          # [B, N, E]
-        self._last_router_logits = logits.detach()
+
+        # Full softmax probs with live graph – used for balance loss
+        probs_for_loss = F.softmax(logits, dim=-1)     # [B, N, E]
 
         if self.top_k > 0 and self.top_k < E:
             # Sparse top-k: zero out non-selected experts, renormalise
@@ -168,9 +213,18 @@ class SoftmaxMoELoRALinear(_BaseLoRALinear):
             dispatch.scatter_(-1, topk_idx, 1.0)
             self._last_dispatch_mask = dispatch.detach()
         else:
-            router_weights = F.softmax(logits, dim=-1)             # [B, N, E]
+            router_weights = probs_for_loss                        # [B, N, E]
             self._last_dispatch_mask = None
 
+        # Balance loss: computed inline with live graph so gradient flows to router
+        mean_prob = probs_for_loss.mean(dim=(0, 1))    # [E], live graph
+        if self._last_dispatch_mask is not None:
+            frac = self._last_dispatch_mask.mean(dim=(0, 1))  # [E], detached (non-diff OK)
+        else:
+            frac = mean_prob.detach()                  # dense: f_i = p_i (use detached copy as coeff)
+        self._balance_loss = self.num_experts * (frac * mean_prob).sum()
+
+        # Stats only – detach so logging doesn't retain graph
         self._last_router_weights = router_weights.detach()
 
         # Efficient MoE forward  (same einsum as ABMIL variant)
@@ -182,17 +236,10 @@ class SoftmaxMoELoRALinear(_BaseLoRALinear):
         return out.squeeze(1) if squeeze else out
 
     def compute_balance_loss(self) -> torch.Tensor:
-        """Switch-Transformer auxiliary load-balance loss."""
-        if self._last_router_logits is None:
+        """Return inline-computed balance loss (has gradient to router)."""
+        if self._balance_loss is None:
             return torch.tensor(0.0)
-        E = self.num_experts
-        probs = F.softmax(self._last_router_logits, dim=-1)   # [B, N, E]
-        mean_prob = probs.mean(dim=(0, 1))                     # [E]
-        if self._last_dispatch_mask is not None:
-            frac = self._last_dispatch_mask.mean(dim=(0, 1))  # [E]
-        else:
-            frac = mean_prob
-        return E * (frac * mean_prob).sum()
+        return self._balance_loss
 
     def get_routing_stats(self) -> dict:
         if self._last_router_weights is None:
@@ -252,6 +299,9 @@ class ABMILMoELoRALinear(_BaseLoRALinear):
         )
         self.experts_B = nn.Parameter(torch.zeros(E, cfg.rank, self.out_features))
 
+        # Cached balance loss (live graph, set in forward)
+        self._balance_loss: Optional[torch.Tensor] = None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         squeeze = x.dim() == 2
         if squeeze:
@@ -266,6 +316,12 @@ class ABMILMoELoRALinear(_BaseLoRALinear):
         gated = v * u                                  # [B, N, D_att]
         scores = self.router_W(gated)                  # [B, N, E]
         router_weights = torch.sigmoid(scores)         # [B, N, E]  (0‥1, independent)
+
+        # Balance loss: variance of per-expert mean activation (live graph)
+        mean_w = router_weights.mean(dim=(0, 1))       # [E], live graph
+        self._balance_loss = mean_w.var()
+
+        # Stats only – detach
         self._last_router_weights = router_weights.detach()
 
         # ---- Efficient LoRA MoE ----
@@ -280,14 +336,10 @@ class ABMILMoELoRALinear(_BaseLoRALinear):
         return out.squeeze(1) if squeeze else out
 
     def compute_balance_loss(self) -> torch.Tensor:
-        """
-        Variance-based balance loss for sigmoid routing.
-        Minimises variance of per-expert mean activation (encourages uniform use).
-        """
-        if self._last_router_weights is None:
+        """Return inline-computed variance balance loss (has gradient to router)."""
+        if self._balance_loss is None:
             return torch.tensor(0.0)
-        mean_w = self._last_router_weights.mean(dim=(0, 1))   # [E]
-        return mean_w.var()
+        return self._balance_loss
 
     def get_routing_stats(self) -> dict:
         if self._last_router_weights is None:
