@@ -355,4 +355,6 @@ class ABMILMoELoRALinear(_BaseLoRALinear):
             "active_experts": (mean_w > 0.1).float().sum().item(),
             "max_weight": mean_w.max().item(),
             "min_weight": mean_w.min().item(),
+            "router_weight_std": mean_w.std().item(),
+            "collapse_score": 1.0 - (mean_w.std() / (mean_w.mean() + 1e-8)).item(),
         }

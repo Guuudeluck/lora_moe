@@ -1,0 +1,46 @@
+# Stage C: Soft-LoRA-MoE (ABMIL) on Qwen2.5-32B / UltraChat-200k (4-8× H200, FSDP)
+# Primary question: does Soft-LoRA-MoE remain stable under multi-GPU load?
+
+model_name_or_path: Qwen/Qwen2.5-32B
+method: soft_lora_moe
+dataset_type: ultrachat
+output_dir: outputs/stageC_soft_lora_moe
+
+# Sequence length
+max_length: 1024
+
+# Training schedule
+num_train_epochs: 3
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 16   # effective batch = 32 (with 8 GPUs: 2*16*8=256)
+learning_rate: 1.0e-4
+lr_scheduler_type: cosine
+warmup_steps: 50
+
+# Optimizer
+optim: adamw_torch_fused
+weight_decay: 0.0
+max_grad_norm: 1.0
+
+# Precision & memory
+gradient_checkpointing: true
+bf16: true
+
+# Eval / save
+eval_steps: 500
+save_steps: 500
+logging_steps: 20
+save_total_limit: 2
+
+# Logging
+report_to: tensorboard
+
+# LoRA / MoE architecture
+target_modules: [q_proj, k_proj, v_proj, o_proj]
+num_experts: 16
+lora_rank: 8
+attention_dim: 64
+balance_loss_coeff: 0.01
+
+# Reproducibility
+seed: 42

@@ -1,0 +1,17 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+fsdp_config:
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_sharding_strategy: FULL_SHARD
+  fsdp_state_dict_type: SHARDED_STATE_DICT
+  fsdp_offload_params: false
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_forward_prefetch: false
+  fsdp_use_orig_params: true
+num_processes: 4   # 4× H200 SXM (override with --num_processes if needed)
+mixed_precision: bf16
+machine_rank: 0
+num_machines: 1
+rdzv_backend: static
+same_network: true
+main_training_function: main

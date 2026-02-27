@@ -1,0 +1,5 @@
+Method,Final Train Loss,Final Eval Loss,Final Eval Perplexity,Mean Routing Entropy,Mean Load CV
+QLoRA (r=16),2.5135,1.1722363233566284,3.23,,
+"Soft-MoE (E=8,H=4)",2.2976,1.1434438228607178,3.14,2.0701,0.1125
+"Sparse-MoE (E=8,H=4,top2)",2.3022,1.154885172843933,3.17,2.046,0.2178
+Soft-LoRA-MoE (ABMIL),2.2356,1.1342819929122925,3.11,2.0785,0.0243

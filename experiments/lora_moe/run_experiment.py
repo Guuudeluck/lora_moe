@@ -50,6 +50,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from experiments.lora_moe.data import load_alpaca
+from experiments.lora_moe.data_mixture import load_ultrachat
 from experiments.lora_moe.injection import inject_lora, print_trainable_params
 from experiments.lora_moe.modules.lora_layers import LoRAConfig, MoELoRAConfig
 from experiments.lora_moe.modules.ffn_moe_layers import MoEFFNConfig
@@ -86,6 +87,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--load_in_4bit", action="store_true")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--report_to", type=str, help="wandb | tensorboard | none")
+    parser.add_argument("--dataset_type", type=str, choices=["alpaca", "ultrachat"],
+                        help="Dataset to use for training")
 
     return parser.parse_args()
 
@@ -106,7 +109,7 @@ def load_config(args: argparse.Namespace) -> dict:
         "model_name_or_path", "method", "output_dir", "num_train_epochs",
         "learning_rate", "per_device_train_batch_size", "gradient_accumulation_steps",
         "max_length", "max_samples", "lora_rank", "num_experts", "expert_hidden_dim",
-        "balance_loss_coeff", "seed", "report_to",
+        "balance_loss_coeff", "seed", "report_to", "dataset_type",
     ]:
         val = getattr(args, key, None)
         if val is not None:
@@ -147,6 +150,7 @@ def build_lora_cfg(cfg: dict) -> LoRAConfig | MoELoRAConfig | MoEFFNConfig:
             dropout=dropout,
             balance_loss_coeff=cfg.get("balance_loss_coeff", 0.01),
             target_modules=target,
+            capacity_factor=cfg.get("capacity_factor", 0.0),
         )
 
     # MoELoRAConfig: softmax_lora_moe | abmil_moe | soft_lora_moe
@@ -199,15 +203,27 @@ def main() -> None:
     tokenizer.padding_side = "right"    # causal LM needs right-padding during training
 
     # ---- Dataset ----
-    print("Loading Alpaca dataset...")
-    datasets = load_alpaca(
-        tokenizer=tokenizer,
-        max_length=cfg.get("max_length", 512),
-        val_split=cfg.get("val_split", 0.05),
-        max_samples=cfg.get("max_samples", None),
-        seed=seed,
-        num_proc=cfg.get("dataloader_num_workers", 4),
-    )
+    dataset_type = cfg.get("dataset_type", "alpaca")
+    if dataset_type == "ultrachat":
+        print("Loading UltraChat-200k dataset...")
+        datasets = load_ultrachat(
+            tokenizer=tokenizer,
+            max_length=cfg.get("max_length", 1024),
+            val_split=cfg.get("val_split", 0.05),
+            max_samples=cfg.get("max_samples", None),
+            seed=seed,
+            num_proc=cfg.get("dataloader_num_workers", 4),
+        )
+    else:
+        print("Loading Alpaca dataset...")
+        datasets = load_alpaca(
+            tokenizer=tokenizer,
+            max_length=cfg.get("max_length", 512),
+            val_split=cfg.get("val_split", 0.05),
+            max_samples=cfg.get("max_samples", None),
+            seed=seed,
+            num_proc=cfg.get("dataloader_num_workers", 4),
+        )
     print(f"  Train : {len(datasets['train']):,} examples")
     print(f"  Val   : {len(datasets['validation']):,} examples\n")
 
@@ -282,6 +298,15 @@ def main() -> None:
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
 
+    # ---- Multi-GPU: read torchrun environment variables ----
+    # TrainingArguments reads LOCAL_RANK / RANK / WORLD_SIZE automatically
+    # from the environment when launched via torchrun or accelerate.
+    # We expose them here for logging purposes only.
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if world_size > 1:
+        print(f"  Distributed training: world_size={world_size}, local_rank={local_rank}")
+
     # ---- Training args ----
     report_to = cfg.get("report_to", "tensorboard")
     training_args = TrainingArguments(
@@ -321,7 +346,8 @@ def main() -> None:
         remove_unused_columns=False,
         dataloader_num_workers=cfg.get("dataloader_num_workers", 4),
         dataloader_pin_memory=True,
-        # Multi-GPU (no-op on single GPU)
+        # Multi-GPU: DDP/FSDP parameters are handled by TrainingArguments
+        # automatically via LOCAL_RANK/WORLD_SIZE env vars set by torchrun.
         ddp_find_unused_parameters=False,
     )
     # Point TensorBoard at our log dir (v5.x style)

@@ -2,6 +2,24 @@
 
 A production-ready framework for finetuning large language models using **transformers + peft + Ray**. Supports LoRA, QLoRA, and full finetuning with distributed training capabilities.
 
+## LoRA MoE Research (experiments/lora_moe)
+
+This repository also contains a research experiment suite comparing **Sparse-MoE** vs
+**Soft-LoRA-MoE (ABMIL)** adapter architectures across 7B–32B models. See the dedicated
+docs:
+
+- **[experiments/lora_moe/README.md](experiments/lora_moe/README.md)** — full experiment documentation
+- **[CLAUDE_CONTEXT.md](CLAUDE_CONTEXT.md)** — onboarding guide for the 4× H200 pod
+
+Quick start:
+```bash
+# Stage B on 4× H200 SXM (recommended)
+bash experiments/lora_moe/run_stageB_4gpu.sh
+
+# Debug smoke test
+bash experiments/lora_moe/run_stageB_4gpu.sh --debug
+```
+
 ## Features
 
 - 🚀 **Modern Stack**: transformers + peft + accelerate + Ray

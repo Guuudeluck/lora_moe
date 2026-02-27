@@ -38,6 +38,8 @@ class MoEFFNConfig:
     target_modules: List[str] = field(
         default_factory=lambda: ["q_proj", "v_proj"]
     )
+    capacity_factor: float = 0.0   # 0 = disabled; 1.25 = standard
+    expert_capacity: int = 0       # computed from capacity_factor if > 0
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +172,7 @@ class SparseMoEFFNLinear(_BaseLoRALinear):
         self.num_experts = E
         self.expert_hidden_dim = H
         self.top_k = cfg.top_k if cfg.top_k > 0 else 2   # default to top-2
+        self.capacity_factor = cfg.capacity_factor
 
         self.router = nn.Linear(self.in_features, E, bias=False)
         nn.init.normal_(self.router.weight, std=0.02)
@@ -180,6 +183,9 @@ class SparseMoEFFNLinear(_BaseLoRALinear):
         self.experts_W2 = nn.Parameter(torch.zeros(E, H, self.out_features))
 
         self._balance_loss: Optional[torch.Tensor] = None
+        self._token_counts_per_expert: Optional[torch.Tensor] = None
+        self._token_counts_raw: Optional[torch.Tensor] = None
+        self._overflow_fraction: float = 0.0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         squeeze = x.dim() == 2
@@ -208,10 +214,58 @@ class SparseMoEFFNLinear(_BaseLoRALinear):
         dispatch = torch.zeros_like(logits)
         dispatch.scatter_(-1, topk_idx, 1.0)
 
+        # Store raw token counts before capacity enforcement
+        token_counts_raw = dispatch.sum(dim=(0, 1)).detach()   # [E], no grad
+
+        # Capacity enforcement (if capacity_factor > 0)
+        if self.capacity_factor > 0:
+            import math as _math
+            capacity = _math.ceil(self.capacity_factor * B * N / E)
+            # For each expert, rank tokens by their router priority (logit value)
+            # Shape of logits after topk masking: we use topk_vals for priority
+            # Build per-expert priority tensor from masked_logits (non-selected = -inf)
+            # rank trick: argsort(argsort(...)) gives rank of each token per expert
+            # dispatch shape: [B, N, E] → reshape to [B*N, E] for ranking
+            dispatch_flat = dispatch.view(B * N, E)            # [T, E]
+            priority_flat = masked_logits.view(B * N, E)       # [T, E]
+
+            # For each expert, rank tokens by descending priority among dispatched ones
+            # Mask non-dispatched tokens to -inf before ranking
+            priority_masked = priority_flat.masked_fill(dispatch_flat == 0, float("-inf"))
+            # ranks[i, e] = position of token i in the queue for expert e (0 = highest priority)
+            sorted_idx = torch.argsort(priority_masked, dim=0, descending=True)
+            ranks = torch.argsort(sorted_idx, dim=0)           # [T, E], rank per (token, expert)
+
+            overflow_mask = (dispatch_flat == 1) & (ranks >= capacity)   # [T, E]
+            self._overflow_fraction = overflow_mask.float().mean().item()
+
+            # Zero overflowed tokens in dispatch
+            dispatch_flat = dispatch_flat.clone()
+            dispatch_flat[overflow_mask] = 0.0
+            dispatch = dispatch_flat.view(B, N, E)
+
+            # Recompute sparse router_weights with updated dispatch.
+            # Tokens that had ALL their top-k assignments dropped (dispatch row all zeros)
+            # produce all-inf masked logits → softmax NaN. Use zeros for such tokens
+            # (they receive no MoE contribution; base output only).
+            masked_logits_cap = logits.masked_fill(dispatch == 0, float("-inf"))
+            cap_weights = F.softmax(masked_logits_cap, dim=-1)   # [B, N, E]
+            # has_expert[b, n] = True if token (b,n) still has at least one expert
+            has_expert = dispatch.sum(dim=-1, keepdim=True) > 0   # [B, N, 1]
+            router_weights = torch.where(
+                has_expert.expand_as(cap_weights), cap_weights, torch.zeros_like(cap_weights)
+            )
+        else:
+            self._overflow_fraction = 0.0
+
         # Balance loss: frac is non-diff (OK), mean_prob has grad → gradient flows
         frac = dispatch.detach().mean(dim=(0, 1))        # [E], no grad
         mean_prob = probs_for_loss.mean(dim=(0, 1))      # [E], live graph
         self._balance_loss = E * (frac * mean_prob).sum()
+
+        # Store final token counts for logging
+        self._token_counts_per_expert = dispatch.sum(dim=(0, 1)).detach()  # [E]
+        self._token_counts_raw = token_counts_raw                          # [E] pre-capacity
 
         # Stats only (detached)
         self._last_router_weights = router_weights.detach()
@@ -238,9 +292,22 @@ class SparseMoEFFNLinear(_BaseLoRALinear):
         mean_w = w.mean(dim=(0, 1)).cpu()       # [E] (sparse: zeros for non-selected)
         p = mean_w / (mean_w.sum() + 1e-8)
         entropy = -(p * (p + 1e-9).log()).sum().item()
-        return {
+
+        stats = {
             "mean_expert_weights": mean_w,
             "weight_entropy": entropy,
             "weight_cv": (mean_w.std() / (mean_w.mean() + 1e-8)).item(),
             "active_experts": (mean_w > 0.01).float().sum().item(),
+            "overflow_fraction": self._overflow_fraction,
         }
+
+        # Token count stats (from dispatch tensor)
+        if self._token_counts_per_expert is not None:
+            token_counts = self._token_counts_per_expert.cpu().float()
+            mean_count = token_counts.mean()
+            stats["token_count_per_expert"] = token_counts.tolist()
+            stats["max_over_mean_load"] = (token_counts.max() / (mean_count + 1e-8)).item()
+            stats["hot_expert_count"] = (token_counts > 2 * mean_count).sum().item()
+            stats["load_variance"] = token_counts.var().item()
+
+        return stats

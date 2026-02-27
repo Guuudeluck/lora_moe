@@ -51,6 +51,8 @@ def collect_routing_metrics(
     entropies: List[float] = []
     cvs: List[float] = []
     actives: List[float] = []
+    max_over_mean_loads: List[float] = []
+    overflow_fractions: List[float] = []
 
     layer_idx = 0
     log: Dict[str, float] = {}
@@ -78,6 +80,27 @@ def collect_routing_metrics(
             log[f"routing/layer{layer_idx:02d}/entropy"] = h
             log[f"routing/layer{layer_idx:02d}/cv"] = cv
             log[f"routing/layer{layer_idx:02d}/active_experts"] = act
+
+            # Sparse-MoE specific stats
+            if isinstance(module, SparseMoEFFNLinear):
+                if "max_over_mean_load" in stats:
+                    mml = stats["max_over_mean_load"]
+                    log[f"routing/layer{layer_idx:02d}/max_over_mean_load"] = mml
+                    max_over_mean_loads.append(mml)
+                if "hot_expert_count" in stats:
+                    log[f"routing/layer{layer_idx:02d}/hot_expert_count"] = stats["hot_expert_count"]
+                if "overflow_fraction" in stats:
+                    of = stats["overflow_fraction"]
+                    log[f"routing/layer{layer_idx:02d}/overflow_fraction"] = of
+                    overflow_fractions.append(of)
+
+            # ABMIL-specific stats (collapse detection)
+            if isinstance(module, ABMILMoELoRALinear):
+                if "collapse_score" in stats:
+                    log[f"routing/layer{layer_idx:02d}/collapse_score"] = stats["collapse_score"]
+                if "router_weight_std" in stats:
+                    log[f"routing/layer{layer_idx:02d}/router_weight_std"] = stats["router_weight_std"]
+
             layer_idx += 1
 
     # Aggregate scalars
@@ -85,6 +108,12 @@ def collect_routing_metrics(
         log["routing/global_entropy"] = sum(entropies) / len(entropies)
         log["routing/global_cv"] = sum(cvs) / len(cvs)
         log["routing/global_active_experts"] = sum(actives) / len(actives)
+
+    if max_over_mean_loads:
+        log["routing/global_max_over_mean_load"] = sum(max_over_mean_loads) / len(max_over_mean_loads)
+
+    if overflow_fractions:
+        log["routing/global_overflow_fraction"] = sum(overflow_fractions) / len(overflow_fractions)
 
     # Aggregate balance loss
     if balance_terms:

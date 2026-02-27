@@ -15,8 +15,10 @@ import torch
 from torch import nn
 from transformers import Trainer
 from transformers.utils import logging
+from safetensors.torch import save_file as save_safetensors, load_file as load_safetensors
 
 from experiments.lora_moe.metrics import collect_routing_metrics, snapshot_expert_weights
+from experiments.lora_moe.timing_callback import StepTimingCallback
 
 logger = logging.get_logger(__name__)
 
@@ -33,12 +35,16 @@ class LoRAMoETrainer(Trainer):
         self.balance_loss_coeff = balance_loss_coeff
         self.method = method
         self._routing_log_buffer: Dict[str, float] = {}
-        # _hf_peft_config_loaded=True is needed only to pass
-        # validate_quantization_for_training() in super().__init__() above.
+        # Register step-timing callback for wall-clock profiling
+        self.add_callback(StepTimingCallback())
+        # _hf_peft_config_loaded=True is set as an INSTANCE attribute only for
+        # QLoRA to bypass validate_quantization_for_training() in __init__().
         # Leaving it set causes save_pretrained to call PEFT-specific methods
         # (active_adapters, get_adapter_state_dict) that don't exist on our
         # custom-injected model.  Safe to remove now that __init__ is done.
-        if hasattr(self.model, "_hf_peft_config_loaded"):
+        # NOTE: PreTrainedModel has this as a CLASS attribute (defaults False),
+        # so we must check __dict__ (instance attrs only), not hasattr.
+        if "_hf_peft_config_loaded" in self.model.__dict__:
             del self.model._hf_peft_config_loaded
 
     # ------------------------------------------------------------------
@@ -80,7 +86,55 @@ class LoRAMoETrainer(Trainer):
         if self._routing_log_buffer:
             logs.update(self._routing_log_buffer)
             self._routing_log_buffer = {}
+        # Flush timing stats collected by StepTimingCallback
+        timing_buf = getattr(self.state, "_timing_log_buffer", {})
+        if timing_buf:
+            logs.update(timing_buf)
+            self.state._timing_log_buffer = {}
         super().log(logs, start_time, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Save only adapter (trainable) weights — keeps checkpoints tiny
+    # (~50 MB) instead of saving the full frozen 7B backbone (~14 GB).
+    # ------------------------------------------------------------------
+
+    def _save(self, output_dir: Optional[str] = None, state_dict=None) -> None:
+        if output_dir is None:
+            output_dir = self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Collect only the trainable parameters (adapter / router / expert weights).
+        adapter_state = {
+            name: param.data.cpu().contiguous()
+            for name, param in self.model.named_parameters()
+            if param.requires_grad
+        }
+        save_safetensors(adapter_state, os.path.join(output_dir, "adapter_model.safetensors"))
+
+        # Also persist the model config so the checkpoint is self-describing.
+        if hasattr(self.model, "config"):
+            self.model.config.save_pretrained(output_dir)
+
+        logger.info(
+            f"Saved adapter weights ({len(adapter_state)} tensors, "
+            f"{sum(t.numel() for t in adapter_state.values()) / 1e6:.1f}M params) "
+            f"to {output_dir}"
+        )
+
+    def _load_best_model(self) -> None:
+        best_dir = self.state.best_model_checkpoint
+        if best_dir is None:
+            return
+        adapter_path = os.path.join(best_dir, "adapter_model.safetensors")
+        if os.path.exists(adapter_path):
+            state_dict = load_safetensors(adapter_path, device="cpu")
+            missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+            if unexpected:
+                logger.warning(f"Unexpected keys when loading adapter: {unexpected[:5]}")
+            logger.info(f"Loaded best adapter from {adapter_path}")
+        else:
+            # Fallback: full checkpoint saved before this change was applied.
+            super()._load_best_model()
 
     # ------------------------------------------------------------------
     # Save routing snapshot on evaluation
